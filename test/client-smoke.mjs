@@ -172,7 +172,7 @@ const docks = descriptors.filter((d) => d.name === 'conversation.input.dock');
 assert.equal(views.length, 0, 'the plugin no longer contributes conversation views');
 assert.equal(docks.length, 1, 'one dock occupant');
 assert.equal(docks[0].id, 'git-diff-pill');
-assert.equal(docks[0].order, 100);
+assert.equal(docks[0].order, -100);
 for (const r of registrations.filter((x) => x.component)) {
   assert.equal(typeof r.component, 'function', 'component is a function');
 }
