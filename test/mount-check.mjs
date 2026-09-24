@@ -13,7 +13,6 @@ const MODULES = [
   '../lib/git.js',
   '../lib/diff.js',
   '../lib/worktree.js',
-  '../lib/autoname.js',
   '../lib/cleanup.js',
   '../lib/state.js',
   '../lib/actions.js',

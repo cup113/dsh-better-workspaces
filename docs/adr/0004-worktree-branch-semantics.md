@@ -2,6 +2,8 @@
 
 Date: 2025-09-08 (v1, after first browser acceptance)
 
+> **Partly superseded by [ADR 0014](./0014-explicit-naming-form-and-folder-derivation.md)** (2026-09-24): the first-message LLM branch rename (Phase B, Amendment 6.A) and the create-on-arm trigger set (Amendment 2) are gone — staging is now an explicit name + base form and the branch name is final. Phase A's branch semantics, Amendment 3 (base = remote head), Amendment 4 (diff modes), Amendment 5 and Amendment 6.B still stand.
+
 ## Context
 
 The v1 hero flow let the user pick a branch and treated the pick as a

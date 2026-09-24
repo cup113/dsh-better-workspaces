@@ -15,18 +15,19 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
    `origin/<name>` row comes first because it IS the default base — cutting
    from `refs/remotes/origin/<name>` starts at the true GitHub head even when
    the local branch lags; diverged locals appear as `<name>（本地）` rows with
-   `+N −M` facts. **Picking a base creates immediately and jumps**
-   (create-on-arm, ADR 0004 Amendment 2): creation gives origin refs a
+   `+N −M` facts. **Staging is a form**: a required branch-name input, a dice
+   button that rolls a mnemonic (`amber-otter-3f2a`), the base picker and a
+   Create button. Picking a base or a PR row is side-effect free — only Create
+   creates and jumps (ADR 0014) — and the chosen name is final: the plugin
+   never renames a branch after creation. Creation gives origin refs a
    bounded 4 s `git fetch --prune` head start (on top of the 180 s background
-   fetch — paseo itself never fetches at create time), cuts the mnemonic
-   placeholder branch, registers a Workspace titled
+   fetch — paseo itself never fetches at create time), cuts the named branch,
+   registers a Workspace titled
    `<source workspace> · <branch>` (renamed as the very next call after
-   registration, so the row does not linger on the placeholder-branch title),
-   creates the target session, migrates the
+   registration), creates the target session, migrates the
    typed draft through the official conversation-input API, opens it and
-   retires the blank launcher — with full rollback on any failure. On the
-   first user message one LLM call renames the branch to a task slug AND
-   titles the session (hosts after restart), and the workspace title follows
+   retires the blank launcher — with full rollback on any failure. The
+   workspace title follows every session title
    as `<source> · <session title>` — only ever for the workspace owning the
    current session's cwd, since every git detection result is tagged with the
    cwd it was resolved for. **The same picker also lists open pull requests**,
@@ -39,8 +40,8 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
    pointed at. A same-repo PR tracks `origin/<headRef>` only when that existing
    remote-tracking ref already resolves to the verified PR head; it never
    manufactures or overwrites the ref. A fork PR deliberately gets no upstream, so the unpushed count and the pull/push ladder stay explicit
-   instead of aiming at the wrong branch. PR worktrees carry no placeholder
-   branch and are never renamed by the first message. Inside a worktree
+   instead of aiming at the wrong branch. PR worktrees take their branch
+   name from the pull request itself. Inside a worktree
    workspace the hero control hides entirely, and the sidebar row trades its
    folder icon for a branch icon. Abandoned staging leftovers are swept
    automatically (boot + hourly) or via `POST /worktrees/cleanup`.
@@ -106,20 +107,20 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
 
 ## Architecture
 
-- **Host** (`lib/index.js` → `git.js`, `worktree.js`, `autoname.js`,
+- **Host** (`lib/index.js` → `git.js`, `worktree.js`,
   `cleanup.js`, `forge.js`, `diff.js`, `actions.js`, `state.js`, `api.js`,
   with `stable.js` as the platform-anchoring layer):
   git-CLI primitives behind an 8-way concurrency scheduler; managed worktrees under
-  `~/.dsh/worktrees/<8-char base36 sha256(mainRepoRoot)>/<slug>` with
+  `~/.dsh/worktrees/<8-char base36 sha256(mainRepoRoot)>/<repo>-<branch>` —
+  the leaf carries the repository name so it is identifiable on its own, and
+  both halves are budgeted to keep it ≤65 characters — with
   `<gitdir>/dsh-worktree/worktree.json` metadata and three creation intents —
   `branch-off` (cut from a base), `checkout`, and `pr-checkout` (fetch the
   forge's `refs/pull/<N>/head` from origin/upstream, create the local branch
   with `git worktree add -b … --no-track <sha>`, take the PR's own base as the
   diff baseline, and track `origin/<headRef>` for same-repo PRs only);
-  first-message branch
-  auto-rename via `ctx.llm.stream` + `ctx.agentDefaultModel` (both optional —
-  absent services keep placeholders; its output budget is sized for a reasoning
-  prelude, because a reasoning model spends it before any text exists); snapshot
+  the leaf derives from `<repo>-<branch>` on the host, so the client sends no
+  directory slug and the plugin makes no LLM calls of its own; snapshot
   hub with fs watchers (1 s debounce, degraded 5 s polling), 180 s background
   fetch and
   fingerprint-deduped SSE; `forge.js` serves both the batched PR/checks GraphQL

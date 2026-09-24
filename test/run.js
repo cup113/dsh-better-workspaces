@@ -14,10 +14,9 @@ const scratch = mkdtempSync(join(tmpdir(), 'dsh-bw-test-'));
 process.env.DSH_HOME = join(scratch, 'dshhome');
 mkdirSync(process.env.DSH_HOME, { recursive: true });
 
-const { detectRepo, resolveDefaultBranch, listBranches, currentBranchInfo, diffStat, porcelainStatus, aheadBehind, runGit, withPinnedGitEnvironment, listCommits, unpushedShas } = await import('../lib/git.js');
-const { createWorktree, listManagedWorktrees, readMetadata, patchMetadata, archiveWorktree, prepareWorkspaceDeletion, pendingWorkspaceDeletions, completeWorkspaceDeletion, recoverPendingTransactions, repoWorktreesRoot, worktreesRoot, validateManagedWorktree, worktreeRowHasPath } = await import('../lib/worktree.js');
-const { createAutoNamer, validateBranchSlug, cleanBranchName, parseNamePayload } = await import('../lib/autoname.js');
-const { computeDiff, commitDiff, resolveDiffRefs } = await import('../lib/diff.js');
+const { detectRepo, resolveDefaultBranch, listBranches, diffStat, porcelainStatus, aheadBehind, runGit, withPinnedGitEnvironment, listCommits, unpushedShas } = await import('../lib/git.js');
+const { createWorktree, listManagedWorktrees, readMetadata, patchMetadata, archiveWorktree, prepareWorkspaceDeletion, pendingWorkspaceDeletions, completeWorkspaceDeletion, recoverPendingTransactions, repoWorktreesRoot, worktreesRoot, validateManagedWorktree, worktreeRowHasPath, deriveWorktreeLeaf } = await import('../lib/worktree.js');
+const { computeDiff, commitDiff } = await import('../lib/diff.js');
 const { commitAction, pullAction, pushAction, discardAction, updateFromBaseAction, createPrAction, buildActionLadder } = await import('../lib/actions.js');
 const { createGitStateHub } = await import('../lib/state.js');
 const { createApi, API_PREFIX } = await import('../lib/api.js');
@@ -422,8 +421,9 @@ await test('createWorktree branch-off', async () => {
   const meta = await readMetadata(wt1.path);
   assert.equal(meta.baseRefName, 'main');
   assert.equal(meta.intent, 'branch-off');
-  // explicit name → never an auto-rename candidate (ADR 0004)
-  assert.equal(meta.autoName.status, 'ineligible');
+  // the leaf carries the repo name so it is identifiable on its own (ADR 0014)
+  assert.equal(meta.slug, deriveWorktreeLeaf(repo, 'feature-x'));
+  assert.equal('autoName' in meta, false, 'no rename machinery is recorded any more');
 });
 
 await test('startup recovery removes abandoned temporary PR refs', async () => {
@@ -436,7 +436,7 @@ await test('startup recovery removes abandoned temporary PR refs', async () => {
 });
 
 await test('createWorktree preserves post-add failures for manual recovery', async () => {
-  const expectedPath = join(await repoWorktreesRoot(repo), 'metadata-failure');
+  const expectedPath = join(await repoWorktreesRoot(repo), deriveWorktreeLeaf(repo, 'metadata-failure'));
   writeFileSync(join(repo, '.git', 'info', 'exclude'), '*.secret\n');
   await assert.rejects(
     createWorktree({
@@ -458,7 +458,7 @@ await test('createWorktree preserves post-add failures for manual recovery', asy
   assert.equal((await recoverPendingTransactions(repo)).ok, true);
   assert.equal((await runGit(['show-ref', '--verify', '--quiet', 'refs/heads/metadata-failure'], { cwd: repo })).ok, false);
 
-  const noOpPath = join(await repoWorktreesRoot(repo), 'metadata-noop');
+  const noOpPath = join(await repoWorktreesRoot(repo), deriveWorktreeLeaf(repo, 'metadata-noop'));
   await assert.rejects(
     createWorktree({
       repoRoot: repo,
@@ -476,7 +476,7 @@ await test('createWorktree preserves post-add failures for manual recovery', asy
   assert.equal((await recoverPendingTransactions(repo)).ok, true);
   assert.equal((await runGit(['show-ref', '--verify', '--quiet', 'refs/heads/metadata-noop'], { cwd: repo })).ok, false);
 
-  const preservedPath = join(await repoWorktreesRoot(repo), 'rollback-remove-failure');
+  const preservedPath = join(await repoWorktreesRoot(repo), deriveWorktreeLeaf(repo, 'rollback-remove-failure'));
   await assert.rejects(
     createWorktree({
       repoRoot: repo,
@@ -529,7 +529,7 @@ await test('recovery refuses a same-path replacement main repository', async () 
   writeFileSync(join(ownerRepo, 'base.txt'), 'base\n');
   git(ownerRepo, 'add', '-A');
   git(ownerRepo, 'commit', '-m', 'base');
-  const orphanPath = join(await repoWorktreesRoot(ownerRepo), 'owner-orphan');
+  const orphanPath = join(await repoWorktreesRoot(ownerRepo), deriveWorktreeLeaf(ownerRepo, 'owner-orphan'));
   await assert.rejects(createWorktree({
     repoRoot: ownerRepo,
     intent: 'branch-off',
@@ -618,16 +618,16 @@ await test('branch-off uses the immutable base OID across a moving branch', asyn
   await archiveWorktree(task.path, { force: true });
 });
 
-await test('branch-off slug placeholder + autoName pending', async () => {
+await test('branch-off slug fallback + repo-prefixed leaf', async () => {
   const wt = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'amber-otter-1234' });
   assert.equal(wt.branch, 'amber-otter-1234');
   const meta = await readMetadata(wt.path);
-  assert.deepEqual(meta.autoName, { status: 'pending', placeholder: 'amber-otter-1234' });
+  assert.equal(meta.slug, deriveWorktreeLeaf(repo, 'amber-otter-1234'));
   assert.equal(meta.baseRefName, 'main'); // default base
   // slugless branch-off falls back to a server-side mnemonic
   const wt2 = await createWorktree({ repoRoot: repo, intent: 'branch-off' });
   assert.match(wt2.branch, /^[a-z]+-[a-z]+-[0-9a-f]{4}$/);
-  assert.equal((await readMetadata(wt2.path)).autoName.status, 'pending');
+  assert.equal((await readMetadata(wt2.path)).slug, deriveWorktreeLeaf(repo, wt2.branch));
 });
 
 await test('createWorktree checkout + duplicate copy branch', async () => {
@@ -639,337 +639,45 @@ await test('createWorktree checkout + duplicate copy branch', async () => {
   await archiveWorktree(dup.path, { force: true });
 });
 
-/* ---------------- first-message branch auto-rename (ADR 0004) ---------------- */
+/* ---------------- directory leaf derivation (ADR 0014) ---------------- */
 
-function mockNamerCtx(streamText) {
-  const handlers = {};
-  const out = {
-    handlers,
-    titles: [],
-    warnings: [],
-    get(name) {
-      if (name === 'llm') {
-        return {
-          async *stream(options) {
-            assert.equal(typeof options.provider, 'string');
-            assert.equal(options.purpose, 'better-workspaces-branch-name');
-            // The budget has to survive a reasoning prelude: a reasoning model
-            // spends it on reasoning-delta before any text-delta exists
-            // (ADR 0004 Amendment 6.A — 64 tokens silently produced no slug).
-            assert.ok(options.maxTokens >= 256, `naming budget too small: ${options.maxTokens}`);
-            // a string reply is the common case; an explicit chunk array lets a
-            // test script the reasoning-only / truncated replies
-            const script = await streamText();
-            if (Array.isArray(script)) {
-              for (const chunk of script) yield chunk;
-              return;
-            }
-            yield { type: 'text-delta', text: script };
-            yield { type: 'finish', reason: { kind: 'stop' } };
-          },
-        };
-      }
-      if (name === 'agentDefaultModel') return { currentSelection: () => ({ provider: 'mock', model: 'mock-1' }) };
-      if (name === 'sessionTitle') return { rename: (session, title) => out.titles.push(title) };
-      return undefined;
-    },
-    on(event, fn) {
-      handlers[event] = fn;
-      return () => {};
-    },
-    logger: {
-      info() {},
-      warn(message) {
-        out.warnings.push(String(message));
-      },
-    },
-  };
-  return out;
-}
+await test('deriveWorktreeLeaf: repo-prefixed, budgeted, deterministic', async () => {
+  assert.equal(deriveWorktreeLeaf('/x/cuplivo', 'fix-login'), 'cuplivo-fix-login');
+  // a branch path flattens into the leaf; the slug rule keeps the characters it
+  // already allowed (underscore) and folds the rest (space)
+  assert.equal(deriveWorktreeLeaf('/x/cuplivo', 'feature/login'), 'cuplivo-feature-login');
+  assert.equal(deriveWorktreeLeaf('/x/society_choosing', 'b'), 'society_choosing-b');
+  assert.equal(deriveWorktreeLeaf('/x/my repo', 'b'), 'my-repo-b');
+  // the repo half keeps its full text up to 24 characters: a truncated tail is
+  // exactly the part that tells two repositories apart
+  assert.equal(deriveWorktreeLeaf('/x/dsh-better-workspaces', 'fix-login'), 'dsh-better-workspaces-fix-login');
+  assert.equal(deriveWorktreeLeaf(`/x/${'r'.repeat(40)}`, 'b'), `${'r'.repeat(24)}-b`);
+  assert.equal(deriveWorktreeLeaf(`/x/${'a'.repeat(23)}-zzz`, 'b'), `${'a'.repeat(23)}-b`,
+    'a cut landing on the separator never leaves a doubled hyphen');
+  // the branch half is capped at 40, keeping a leaf inside a Windows-safe budget
+  assert.equal(deriveWorktreeLeaf('/x/repo', 'b'.repeat(60)), `repo-${'b'.repeat(40)}`);
+  assert.ok(deriveWorktreeLeaf(`/x/${'r'.repeat(24)}`, 'b'.repeat(40)).length <= 65);
+  // a name with no path-safe characters degrades to the slug fallback
+  assert.equal(deriveWorktreeLeaf('/x/中文仓库', 'fix-login'), 'wt-fix-login');
+  assert.equal(deriveWorktreeLeaf('/x/repo', ''), 'repo-wt');
+});
 
-await test('branch divergence facts + exact-ref base (paseo picker parity)', async () => {
-  // purpose-made branch pair so no existing branch (main is wt1's measure,
-  // feature is checked out in wt2) is touched: divbr local is one empty
-  // commit ahead of its own remote-tracking ref
-  const sha0 = git(repo, 'rev-parse', 'main').trim();
-  git(repo, 'update-ref', 'refs/remotes/origin/divbr', sha0);
-  const tree = git(repo, 'rev-parse', 'main^{tree}').trim();
-  const advanced = git(repo, 'commit-tree', tree, '-p', sha0, '-m', 'advance divbr').trim();
-  git(repo, 'update-ref', 'refs/heads/divbr', advanced);
-
-  const branches = await listBranches(repo);
-  const divbr = branches.find((b) => b.name === 'divbr');
-  assert.ok(divbr.hasLocal && divbr.hasRemote);
-  assert.equal(divbr.localOid, advanced);
-  assert.equal(divbr.remoteOid, sha0);
-  assert.equal(divbr.localAhead, 1);
-  assert.equal(divbr.localBehind, 0);
-
+await test('createWorktree: a named branch-off keeps its picked base and records no rename state', async () => {
+  git(repo, 'branch', 'form-base', 'main');
   const wt = await createWorktree({
     repoRoot: repo,
     intent: 'branch-off',
-    slug: 'exact-base-0001',
-    base: 'refs/remotes/origin/divbr',
-    sourceTitle: '  My Source Workspace  ',
+    branchName: 'form-named',
+    base: 'refs/heads/form-base',
   });
-  assert.equal(git(wt.path, 'rev-parse', 'HEAD').trim(), sha0, 'cut from the exact remote ref');
+  assert.equal(wt.branch, 'form-named');
+  assert.equal(wt.baseRefName, 'form-base', 'the picked base travels with the name (ADR 0014)');
+  assert.equal(wt.baseRef, git(repo, 'rev-parse', 'refs/heads/form-base').trim());
   const meta = await readMetadata(wt.path);
-  assert.equal(meta.baseRefName, 'divbr');
-  assert.equal(meta.sourceWorkspaceTitle, 'My Source Workspace');
-  await assert.rejects(
-    createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'exact-base-bad', base: 'refs/heads/definitely-missing' }),
-    /does not exist/,
-  );
+  assert.equal(meta.slug, deriveWorktreeLeaf(repo, 'form-named'));
+  assert.equal('autoName' in meta, false, 'the rename machinery is gone, not merely disabled');
   await archiveWorktree(wt.path, { force: true });
-});
-
-await test('task diff = the worktree session history (paseo worktree-diff parity)', async () => {
-  const wt = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'task-mode-0001', base: 'main' });
-  // committed change since the base…
-  writeFileSync(join(wt.path, 'task-committed.txt'), 'one\n');
-  git(wt.path, 'add', '-A');
-  git(wt.path, '-c', 'user.email=t@t.example', '-c', 'user.name=t', 'commit', '-m', 'task commit');
-  // …then uncommitted edits + an untracked file on top
-  writeFileSync(join(wt.path, 'task-committed.txt'), 'one\ntwo\n');
-  writeFileSync(join(wt.path, 'task-untracked.txt'), 'fresh\n');
-  const result = await computeDiff(wt.path, { mode: 'task' });
-  assert.ok(result.refs.label.startsWith('task:'));
-  const paths = result.files.map((f) => f.path);
-  assert.ok(paths.includes('task-committed.txt'), 'committed-then-edited file present');
-  assert.ok(paths.includes('task-untracked.txt'), 'untracked file present');
-  const committed = result.files.find((f) => f.path === 'task-committed.txt');
-  assert.equal(committed.additions, 2, 'measured against the base, not HEAD');
-  const refs = await resolveDiffRefs(wt.path, { mode: 'task' });
-  const log = git(wt.path, 'log', '--oneline', `${refs.baseRef}..HEAD`).trim().split('\n');
-  assert.equal(log.length, 1, 'commit pane range is base..HEAD');
-  await assert.rejects(computeDiff(repo, { mode: 'task' }), /task-base-missing/);
-  await archiveWorktree(wt.path, { force: true });
-});
-
-await test('autoname: slug rules + cleaner', async () => {
-  assert.equal(validateBranchSlug('fix-login').valid, true);
-  assert.equal(validateBranchSlug('fix/login-2').valid, true);
-  assert.equal(validateBranchSlug('Fix-Login').valid, false);
-  assert.equal(validateBranchSlug('-lead').valid, false);
-  assert.equal(validateBranchSlug('trail-').valid, false);
-  assert.equal(validateBranchSlug('a--b').valid, false);
-  assert.equal(cleanBranchName('```git\nfix-login-bug\n```'), 'fix-login-bug');
-  assert.equal(cleanBranchName('"Add Dark Mode"'), 'add');
-  assert.equal(cleanBranchName('修复登录'), '');
-  assert.equal(cleanBranchName('  FIX--Login_Bug  '), 'fix-login-bug');
-  assert.deepEqual(parseNamePayload('```json\n{"title":" 修复登录 ","branch":"fix-login"}\n```'), { title: '修复登录', branch: 'fix-login' });
-  assert.deepEqual(parseNamePayload('prose without json'), { title: null, branch: 'prose' });
-  assert.deepEqual(parseNamePayload('{"title":"","branch":"x-y"}'), { title: null, branch: 'x-y' });
-});
-
-await test('autoname: first-message rename end-to-end', async () => {
-  let reply = JSON.stringify({ title: '修复登录 bug', branch: 'fix-login-bug' });
-  const ctx = mockNamerCtx(() => reply);
-  const namer = createAutoNamer(ctx, null);
-  assert.equal(typeof ctx.handlers['session/event'], 'function');
-
-  const wt = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'brave-falcon-abcd' });
-  const session = { id: 's-test', header: { cwd: wt.path } };
-  const event = {
-    type: 'user/message',
-    seq: 1,
-    data: { source: { kind: 'user' }, content: [{ type: 'text', text: '帮我修复登录 bug' }] },
-  };
-
-  ctx.handlers['session/event'](session, event);
-  await new Promise((r) => setTimeout(r, 300));
-  assert.equal(git(wt.path, 'branch', '--show-current').trim(), 'fix-login-bug');
-  const meta = await readMetadata(wt.path);
-  assert.equal(meta.branch, 'fix-login-bug');
-  assert.equal(meta.autoName.status, 'renamed');
-  assert.equal(meta.autoName.placeholder, 'brave-falcon-abcd');
-  assert.deepEqual(ctx.titles, ['修复登录 bug'], 'same LLM call names the session');
-
-  // one-shot: a later message never renames again
-  reply = 'something-else';
-  await namer.attempt(session, 'second message');
-  assert.equal(git(wt.path, 'branch', '--show-current').trim(), 'fix-login-bug');
-  await archiveWorktree(wt.path, { force: true });
-});
-
-await test('autoname: dispose drains an in-flight model without late mutation', async () => {
-  let releaseReply;
-  let markEntered;
-  const entered = new Promise((resolveEntered) => { markEntered = resolveEntered; });
-  const replyGate = new Promise((resolveReply) => { releaseReply = resolveReply; });
-  const ctx = mockNamerCtx(async () => {
-    markEntered();
-    await replyGate;
-    return JSON.stringify({ title: 'Must Not Apply', branch: 'must-not-apply' });
-  });
-  let invalidations = 0;
-  const namer = createAutoNamer(ctx, { invalidate: async () => { invalidations += 1; } });
-  const wt = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'dispose-namer' });
-  const placeholder = wt.branch;
-  const running = namer.attempt({ id: 'dispose-session', header: { cwd: wt.path } }, 'rename me');
-  await entered;
-  const draining = namer.dispose();
-  releaseReply();
-  await Promise.all([running, draining]);
-  assert.equal(await currentBranchInfo(wt.path).then((value) => value.branch), placeholder);
-  assert.equal((await readMetadata(wt.path)).branch, placeholder);
-  assert.deepEqual(ctx.titles, []);
-  assert.equal(invalidations, 0);
-  await archiveWorktree(wt.path, { force: true });
-});
-
-await test('autoname: metadata failure compensates the branch rename', async () => {
-  const ctx = mockNamerCtx(() => JSON.stringify({ title: 'Compensate', branch: 'compensated-name' }));
-  let patchCalls = 0;
-  const namer = createAutoNamer(ctx, null, {
-    patchMetadata: async (...args) => {
-      patchCalls += 1;
-      if (patchCalls === 2) throw new Error('injected auto-name metadata failure');
-      return patchMetadata(...args);
-    },
-  });
-  const wt = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'compensate-namer' });
-  const placeholder = wt.branch;
-  await namer.attempt({ id: 'compensate-session', header: { cwd: wt.path } }, 'rename me');
-  assert.equal((await currentBranchInfo(wt.path)).branch, placeholder);
-  const metadata = await readMetadata(wt.path);
-  assert.equal(metadata.branch, placeholder);
-  assert.equal(metadata.autoName.status, 'attempted');
-  assert.ok(ctx.warnings.some((message) => /branch compensation completed/.test(message)), ctx.warnings.join(' | '));
-  await namer.dispose();
-  await archiveWorktree(wt.path, { force: true });
-});
-
-await test('autoname: false metadata CAS result also compensates rename', async () => {
-  const ctx = mockNamerCtx(() => JSON.stringify({ title: 'Compensate False', branch: 'false-cas-name' }));
-  let patchCalls = 0;
-  const namer = createAutoNamer(ctx, null, {
-    patchMetadata: async (...args) => {
-      patchCalls += 1;
-      if (patchCalls >= 2) return false;
-      return patchMetadata(...args);
-    },
-  });
-  const wt = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'false-cas-namer' });
-  const placeholder = wt.branch;
-  await namer.attempt({ id: 'false-cas-session', header: { cwd: wt.path } }, 'rename me');
-  assert.equal((await currentBranchInfo(wt.path)).branch, placeholder);
-  const metadata = await readMetadata(wt.path);
-  assert.equal(metadata.branch, placeholder);
-  assert.equal(metadata.autoName.status, 'attempted');
-  await namer.dispose();
-  await archiveWorktree(wt.path, { force: true });
-});
-
-await test('autoname: queued attempt revalidates Workspace capability', async () => {
-  const ctx = mockNamerCtx(() => 'must-not-apply');
-  const wt = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'auth-namer' });
-  const identity = statSync(wt.path);
-  const mainIdentity = statSync(repo);
-  let allowed = true;
-  let markQueued;
-  const queued = new Promise((resolveQueued) => { markQueued = resolveQueued; });
-  const mutations = {
-    run(key, task, options) {
-      markQueued();
-      return hostMutationCoordinator.run(key, task, options);
-    },
-  };
-  const namer = createAutoNamer(ctx, null, {
-    mutations,
-    authorizeTarget: async (cwd) => allowed
-      ? { ok: true, cwd, root: cwd, mainRepoRoot: repo, gitBoundary: 'root', identity: { dev: identity.dev, ino: identity.ino }, mainIdentity: { dev: mainIdentity.dev, ino: mainIdentity.ino } }
-      : { ok: false, reason: 'unauthorized' },
-  });
-  const release = await hostMutationCoordinator.acquire(`git:${repo}`);
-  const attempt = namer.attempt({ id: 'auth-namer-session', header: { cwd: wt.path } }, 'rename me');
-  await queued;
-  allowed = false;
-  release();
-  await attempt;
-  assert.equal((await readMetadata(wt.path)).autoName.status, 'pending');
-  assert.equal((await currentBranchInfo(wt.path)).branch, wt.branch);
-  await namer.dispose();
-  await archiveWorktree(wt.path, { force: true });
-});
-
-await test('autoname: prose fallback keeps branch-only', async () => {
-  const ctx = mockNamerCtx(() => 'plain-slug-only');
-  const namer = createAutoNamer(ctx, null);
-  const wt = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'golden-vale-9090' });
-  await namer.attempt({ id: 'sf', header: { cwd: wt.path } }, 'hello');
-  assert.equal(git(wt.path, 'branch', '--show-current').trim(), 'plain-slug-only');
-  assert.deepEqual(ctx.titles, []);
-  await archiveWorktree(wt.path, { force: true });
-});
-
-await test('autoname: a reasoning-only reply keeps the placeholder and says why', async () => {
-  // the field failure of ADR 0004 Amendment 6.A: reasoning tokens outran the
-  // output budget, so the reply carried no text at all
-  const ctx = mockNamerCtx(() => [
-    { type: 'reasoning-delta', text: 'thinking about the prompt' },
-    { type: 'reasoning-delta', text: 'still thinking' },
-    { type: 'finish', reason: { kind: 'max-tokens' } },
-  ]);
-  const namer = createAutoNamer(ctx, null);
-  const wt = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'quiet-heron-7777' });
-  await namer.attempt({ id: 's7', header: { cwd: wt.path } }, 'hi');
-  assert.equal(git(wt.path, 'branch', '--show-current').trim(), 'quiet-heron-7777');
-  assert.equal((await readMetadata(wt.path)).autoName.status, 'attempted');
-  assert.deepEqual(ctx.titles, [], 'an empty reply never names the session');
-  assert.ok(
-    ctx.warnings.some((m) => m.includes('max-tokens') && m.includes('reasoning chunks')),
-    `expected a diagnostic warning, saw ${JSON.stringify(ctx.warnings)}`,
-  );
-  await archiveWorktree(wt.path, { force: true });
-});
-
-await test('autoname: guards (manual rename, invalid output, collision, subagent, non-worktree)', async () => {
-  let reply = 'should-not-apply';
-  const ctx = mockNamerCtx(() => reply);
-  const namer = createAutoNamer(ctx, null);
-
-  // manual rename before the first message → attempted, branch untouched
-  const wt = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'calm-heron-1111' });
-  git(wt.path, 'branch', '-m', 'calm-heron-1111', 'my-manual-name');
-  await namer.attempt({ id: 's2', header: { cwd: wt.path } }, 'hello');
-  assert.equal(git(wt.path, 'branch', '--show-current').trim(), 'my-manual-name');
-  assert.equal((await readMetadata(wt.path)).autoName.status, 'attempted');
-
-  // invalid model output (non-latin) → placeholder kept, one-shot consumed
-  const wt2 = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'dusty-lynx-2222' });
-  reply = '修复登录问题';
-  await namer.attempt({ id: 's3', header: { cwd: wt2.path } }, 'hello');
-  assert.equal(git(wt2.path, 'branch', '--show-current').trim(), 'dusty-lynx-2222');
-  assert.equal((await readMetadata(wt2.path)).autoName.status, 'attempted');
-
-  // collision with an existing branch → -2 suffix (paseo findAvailableBranchName)
-  const wt3 = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'eager-otter-3333' });
-  reply = 'feature';
-  await namer.attempt({ id: 's4', header: { cwd: wt3.path } }, 'hello');
-  assert.equal(git(wt3.path, 'branch', '--show-current').trim(), 'feature-2');
-
-  // subagent sessions never trigger
-  let called = false;
-  const ctx2 = mockNamerCtx(() => {
-    called = true;
-    return 'nope';
-  });
-  createAutoNamer(ctx2, null);
-  const wt4 = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'fierce-wolf-4444' });
-  ctx2.handlers['session/event'](
-    { id: 's5', header: { cwd: wt4.path, parentSession: 'parent-1' } },
-    { type: 'user/message', seq: 1, data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'hi' }] } },
-  );
-  await new Promise((r) => setTimeout(r, 100));
-  assert.equal(called, false);
-  assert.equal(git(wt4.path, 'branch', '--show-current').trim(), 'fierce-wolf-4444');
-
-  // plain repo cwd (outside worktrees root) → ignored even with pending-looking metadata
-  await namer.attempt({ id: 's6', header: { cwd: repo } }, 'hello');
-  assert.equal(git(repo, 'branch', '--show-current').trim(), 'main');
-
-  for (const p of [wt.path, wt2.path, wt3.path, wt4.path]) await archiveWorktree(p, { force: true });
+  git(repo, 'branch', '-D', 'form-base');
 });
 
 await test('listManagedWorktrees', async () => {

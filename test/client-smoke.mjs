@@ -1050,21 +1050,79 @@ assert.equal(T.transferSessionDraft(
 ), false, 'structured references fail closed because setDraft cannot preserve chips');
 assert.equal(referenceSource.state.getSnapshot().draft, '@issue');
 
-const persistedA = T.heroCreationRequest('source-tx', { cwd: '/a', base: 'main' }, () => ({ slug: 'stable' }));
-const persistedB = T.heroCreationRequest('source-tx', { cwd: '/a', base: 'main' }, () => ({ slug: 'wrong' }));
+const persistedA = T.heroCreationRequest('source-tx', { cwd: '/a', base: 'main', branchName: 'fix-login' }, () => ({ branchName: 'fix-login', base: 'main' }));
+const persistedB = T.heroCreationRequest('source-tx', { cwd: '/a', base: 'main', branchName: 'fix-login' }, () => ({ branchName: 'clobber', base: 'main' }));
 assert.equal(persistedB.txId, persistedA.txId);
 assert.equal(persistedB.targetSessionId, `session-${persistedA.txId}`,
   'target Session identity is deterministic across lost create responses');
-assert.deepEqual(persistedB.body, { slug: 'stable' }, 'retry keeps the exact request body and slug');
-const persistedConflict = T.heroCreationRequest('source-tx', { cwd: '/a', base: 'other' }, () => ({ slug: 'duplicate' }));
+assert.deepEqual(persistedB.body, { branchName: 'fix-login', base: 'main' }, 'retry keeps the exact request body');
+const persistedConflict = T.heroCreationRequest('source-tx', { cwd: '/a', base: 'other' }, () => ({ branchName: 'duplicate' }));
 assert.equal(persistedConflict.txId, persistedA.txId, 'unresolved receipt converges before a changed selection can mint another tx');
-assert.deepEqual(persistedConflict.body, { slug: 'stable' });
+assert.deepEqual(persistedConflict.body, { branchName: 'fix-login', base: 'main' });
 T.clearHeroCreationTx('source-tx', persistedA.txId);
 
-// staging dictionary keys present in both locales
-assert.equal(dictionaries.dicts.zh['hero.stageHint'], '选定基分支即创建并跳转，草稿随迁');
+// the form's name gate mirrors the host's branch-name rules (ADR 0014)
+assert.equal(T.branchNameProblem('fix-login'), null);
+assert.equal(T.branchNameProblem('fix/login-2'), null);
+assert.equal(T.branchNameProblem('Feature/Login'), null, 'git accepts uppercase; the host stays the authority');
+assert.equal(T.branchNameProblem(''), 'empty');
+assert.equal(T.branchNameProblem('   '), 'empty');
+assert.equal(T.branchNameProblem('-lead'), 'invalid');
+assert.equal(T.branchNameProblem('/lead'), 'invalid');
+assert.equal(T.branchNameProblem('trail.'), 'invalid');
+assert.equal(T.branchNameProblem('a..b'), 'invalid');
+assert.equal(T.branchNameProblem('a//b'), 'invalid');
+assert.equal(T.branchNameProblem('a b'), 'invalid');
+assert.equal(T.branchNameProblem('a\\b'), 'invalid');
+assert.equal(T.branchNameProblem('a.lock'), 'invalid');
+assert.equal(T.branchNameProblem('x'.repeat(256)), 'invalid');
+
+// one staged form always submits the name AND the picked base — the pre-form
+// shape dropped the base whenever a name was present — and never a slug
+const staged = T.stagedCreateRequest({
+  cwd: '/a', sourceId: 'source-1', sourceTitle: 'repo', pull: null,
+  name: '  fix-login  ', baseRef: 'refs/remotes/origin/main',
+});
+assert.deepEqual(staged.body, {
+  cwd: '/a', sourceSessionId: 'source-1', intent: 'branch-off', sourceTitle: 'repo',
+  branchName: 'fix-login', base: 'refs/remotes/origin/main',
+});
+assert.equal('slug' in staged.body, false, 'the client no longer mints a directory slug');
+assert.deepEqual(staged.selection, {
+  cwd: '/a', intent: 'branch-off', branchName: 'fix-login', base: 'refs/remotes/origin/main', pull: null,
+});
+const stagedNoBase = T.stagedCreateRequest({ cwd: '/a', sourceId: 's', sourceTitle: 't', pull: null, name: 'x', baseRef: null });
+assert.equal('base' in stagedNoBase.body, false, 'an unresolved base is omitted, not sent as null');
+const stagedPr = T.stagedCreateRequest({
+  cwd: '/a', sourceId: 's', sourceTitle: 't', name: 'ignored', baseRef: 'refs/heads/main',
+  pull: {
+    host: 'github.com', owner: 'o', repo: 'r', number: 12, headRefName: 'fix-login',
+    baseRefName: 'main', fork: true, headOwnerLogin: 'alice',
+  },
+});
+assert.deepEqual(stagedPr.body, {
+  cwd: '/a', sourceSessionId: 's', intent: 'checkout', sourceTitle: 't',
+  pull: { host: 'github.com', owner: 'o', repo: 'r', number: 12, headRef: 'fix-login', baseRef: 'main', forkOwner: 'alice' },
+});
+assert.equal(stagedPr.selection.branchName, null, 'a PR checkout takes its branch from the pull request');
+assert.equal(stagedPr.selection.base, null);
+
+// staging form dictionary keys present in both locales
+assert.equal(dictionaries.dicts.zh['hero.name'], '分支名');
+assert.equal(dictionaries.dicts.en['hero.name'], 'Branch name');
+assert.equal(dictionaries.dicts.zh['hero.diceName'], '随机命名');
+assert.equal(dictionaries.dicts.en['hero.diceName'], 'Roll a random name');
+assert.equal(dictionaries.dicts.zh['hero.checkoutPr'], '检出 PR');
+assert.equal(dictionaries.dicts.en['hero.checkoutPr'], 'Check out PR');
+assert.equal(dictionaries.dicts.zh['hero.nameInvalid'], '分支名不合法');
+assert.equal(dictionaries.dicts.en['hero.prNameLocked'], "A PR checkout uses the pull request's branch name");
 assert.equal(dictionaries.dicts.zh['hero.blockReason'], '正在创建隔离 Worktree…');
-assert.equal(dictionaries.dicts.en['hero.stageCreateFallback'], 'Create now');
+// create-on-arm strings are gone, not merely unused (ADR 0014)
+assert.equal(dictionaries.dicts.zh['hero.stageHint'], undefined, 'create-on-arm hint removed');
+assert.equal(dictionaries.dicts.en['hero.stageCreateFallback'], undefined, 'create-on-arm fallback removed');
+assert.equal(dictionaries.dicts.zh['hero.newBranchItem'], undefined, 'the panel name input moved into the hero form');
+assert.equal(dictionaries.dicts.zh['hero.pickExplicit'], undefined, 'the picker no longer carries a name');
+assert.equal(dictionaries.dicts.zh['hero.baseHint'], undefined, 'the panel base hint left with the panel input');
 assert.equal(dictionaries.dicts.zh['hero.modeWorktreePick'], undefined, 'two-item menu: pick variant removed');
 assert.equal(dictionaries.dicts.zh['hero.stageAttachWarn'], undefined, 'attach warning removed with the intercept');
 assert.equal(dictionaries.dicts.zh['hero.modeLocal'], '本地');
