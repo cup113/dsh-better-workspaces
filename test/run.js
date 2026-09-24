@@ -15,7 +15,7 @@ process.env.DSH_HOME = join(scratch, 'dshhome');
 mkdirSync(process.env.DSH_HOME, { recursive: true });
 
 const { detectRepo, resolveDefaultBranch, listBranches, currentBranchInfo, diffStat, porcelainStatus, aheadBehind, runGit, withPinnedGitEnvironment, listCommits, unpushedShas } = await import('../lib/git.js');
-const { createWorktree, listManagedWorktrees, readMetadata, patchMetadata, archiveWorktree, prepareWorkspaceDeletion, pendingWorkspaceDeletions, completeWorkspaceDeletion, recoverPendingTransactions, repoWorktreesRoot, worktreesRoot, validateManagedWorktree } = await import('../lib/worktree.js');
+const { createWorktree, listManagedWorktrees, readMetadata, patchMetadata, archiveWorktree, prepareWorkspaceDeletion, pendingWorkspaceDeletions, completeWorkspaceDeletion, recoverPendingTransactions, repoWorktreesRoot, worktreesRoot, validateManagedWorktree, worktreeRowHasPath } = await import('../lib/worktree.js');
 const { createAutoNamer, validateBranchSlug, cleanBranchName, parseNamePayload } = await import('../lib/autoname.js');
 const { computeDiff, commitDiff, resolveDiffRefs } = await import('../lib/diff.js');
 const { commitAction, pullAction, pushAction, discardAction, updateFromBaseAction, createPrAction, buildActionLadder } = await import('../lib/actions.js');
@@ -2355,6 +2355,25 @@ if [ "$FAKE_GH_UNAUTH" = "1" ]; then
   exit 1
 fi
 
+# the disabled-issues fixture: the PR list works, the issue list answers
+# exactly the way a repository with its issue tracker turned off does
+if [ "$FAKE_GH_ISSUES_DISABLED" = "1" ] && [ "$1 $2" = "issue list" ]; then
+  echo "the 'acme/widget' repository has disabled issues" >&2
+  exit 1
+fi
+
+# an issue-side transport failure — NOT the disabled-issues shape, so the
+# merged listing must stay partial and name the issue side
+if [ "$FAKE_GH_ISSUES_FAIL" = "1" ] && [ "$1 $2" = "issue list" ]; then
+  echo "gh: connection reset by peer" >&2
+  exit 1
+fi
+
+if [ "$FAKE_GH_PULLS_FAIL" = "1" ] && [ "$1 $2" = "pr list" ]; then
+  echo "gh: connection reset by peer" >&2
+  exit 1
+fi
+
 case "$1 $2" in
   "auth status")
     echo "github.com"
@@ -2639,6 +2658,53 @@ await test('forge: auth states + gh JSON flattening (list + detail)', async () =
   assert.equal(missing.authState, 'error');
   assert.equal(missing.reason, 'not_found');
   assert.match(missing.message, /no pull requests or issues matched/);
+});
+
+await test('forge: a repository with disabled issues keeps the pull request list intact', async () => {
+  process.env.FAKE_GH_ISSUES_DISABLED = '1';
+  invalidateForgeList();
+  let listed;
+  try {
+    listed = await listForgeItems({ cwd: prRepo, identity: forgeIdentity });
+  } finally {
+    delete process.env.FAKE_GH_ISSUES_DISABLED;
+    invalidateForgeList();
+  }
+  // the issue tracker being off is not a listing failure: no error banner, and
+  // the PR side is complete (regression: this surfaced as "Pull request list
+  // unavailable: … repository has disabled issues")
+  assert.equal(listed.authState, 'authenticated', JSON.stringify(listed));
+  assert.equal(listed.error, undefined);
+  assert.deepEqual(listed.items.map((i) => i.kind), ['change_request', 'change_request', 'change_request']);
+  assert.deepEqual(listed.items.map((i) => i.number), [12, 9, 5]);
+});
+
+await test('forge: a partial listing names the failing side', async () => {
+  process.env.FAKE_GH_PULLS_FAIL = '1';
+  invalidateForgeList();
+  let pullsFailed;
+  try {
+    pullsFailed = await listForgeItems({ cwd: prRepo, identity: forgeIdentity });
+  } finally {
+    delete process.env.FAKE_GH_PULLS_FAIL;
+    invalidateForgeList();
+  }
+  assert.equal(pullsFailed.authState, 'partial');
+  assert.equal(pullsFailed.partialSide, 'pulls');
+  assert.deepEqual(pullsFailed.items.map((i) => i.kind), ['issue', 'issue']);
+
+  process.env.FAKE_GH_ISSUES_FAIL = '1';
+  invalidateForgeList();
+  let issuesFailed;
+  try {
+    issuesFailed = await listForgeItems({ cwd: prRepo, identity: forgeIdentity });
+  } finally {
+    delete process.env.FAKE_GH_ISSUES_FAIL;
+    invalidateForgeList();
+  }
+  assert.equal(issuesFailed.authState, 'partial');
+  assert.equal(issuesFailed.partialSide, 'issues');
+  assert.deepEqual(issuesFailed.items.map((i) => i.kind), ['change_request', 'change_request', 'change_request']);
 });
 
 await test('api: /pulls + /pull over real HTTP (fake gh)', async () => {
@@ -3021,12 +3087,25 @@ await test('platform anchoring helpers', async () => {
     assert.equal(stable.isWindows(), true);
     assert.equal(stable.samePath('/a/B/c', '/A/b/C'), true);
     assert.equal(stable.samePath('/a/B/c', '/a/B/d'), false);
+    // ownership rows: git prints forward-slash paths on Windows while every
+    // recorded path uses backslashes, so the row match must normalize first
+    // (a raw `worktree ${path}` comparison made every create fail post-add)
+    const winRow = 'worktree C:/Users/x/.dsh/worktrees/ab12cd34/wt-1\nHEAD 1111111111111111111111111111111111111111\nbranch refs/heads/wt-1';
+    assert.equal(worktreeRowHasPath(winRow, 'C:\\Users\\x\\.dsh\\worktrees\\ab12cd34\\wt-1'), true);
+    assert.equal(worktreeRowHasPath(winRow, 'C:\\Users\\X\\.dsh\\worktrees\\ab12cd34\\WT-1'), true);
+    assert.equal(worktreeRowHasPath(winRow, 'C:\\Users\\x\\.dsh\\worktrees\\ab12cd34\\other'), false);
+    assert.equal(worktreeRowHasPath('branch refs/heads/wt-1\nHEAD 1111', 'C:\\Users\\x\\.dsh\\worktrees\\ab12cd34\\wt-1'), false);
     stable.__setPlatformForTests(null);
     assert.equal(stable.isDirfdPinSupported(), process.platform === 'linux');
     assert.equal(stable.isFileExchangeSupported(), process.platform === 'linux');
     assert.equal(stable.isWindows(), process.platform === 'win32');
-    assert.equal(stable.samePath('/a/B/c', '/A/b/C'), false);
+    // case folding is a win32 semantic, not a POSIX one: after the simulation
+    // is restored the real platform decides, so Windows stays usable as a host
+    assert.equal(stable.samePath('/a/B/c', '/A/b/C'), process.platform === 'win32');
     assert.equal(stable.samePath('/a/b/c', '/a/b/c'), true);
+    // a POSIX-shaped row keeps matching through the same helper
+    assert.equal(worktreeRowHasPath('worktree /tmp/a/wt\nbranch refs/heads/wt', '/tmp/a/wt'), true);
+    assert.equal(worktreeRowHasPath('worktree /tmp/a/wt\nbranch refs/heads/wt', '/tmp/a/wt-2'), false);
     // stat identity verification is the path-mode anchor proof
     const info = statSync(repo);
     assert.equal(await stable.verifyStatIdentity(repo, { dev: info.dev, ino: info.ino }), true);

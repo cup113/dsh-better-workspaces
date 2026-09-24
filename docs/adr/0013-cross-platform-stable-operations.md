@@ -33,3 +33,13 @@
 - 路径模式承认一个有界的操作中 TOCTOU 窗口：边界核验与变更后复验约束两端，仓库族 FIFO gate 消除插件自身的交错；这正是 paseo 在所有平台上的既有取舍。恶意本地进程在窗口内换绑目录的行为在 Linux 上被 dirfd 阻断，在路径模式下会以 409 stale-target/identity-changed 收敛——与「用户在插件外直接运行 Git 不受此门约束」的既有边界一致。
 - 路径模式保存的「绝不丢失提交点之前的并发写」弱化为「CAS 复查与 rename 之间不落任何插件写入」；被外部进程无共享删除句柄占用的目标在 Windows 上 rename 报 EPERM/EBUSY，接口以 409 显式失败而不是静默覆盖。
 - dev/ino 身份依赖文件系统提供稳定 file id：NTFS/ReFS 满足；FAT 类与部分网络盘可能退化（README 注明）。测试矩阵在 Linux CI 上以模拟平台覆盖非 Linux 分支，Windows 真机行为由与 paseo 相同的原语（普通 cwd git、stat 身份、rename 保存）保证，仍需装机自检（README 运维三步）。
+
+## 修订 1：真机 Windows 暴露的三处 path-mode 缺陷（2026-09-24）
+
+CI 只能在 POSIX 宿主上**模拟**平台分支（Git 仍输出 POSIX 路径形状），下列缺陷在模拟测试下全部隐形，只有 Windows 真机才现形。三处均已修复，并以真机端到端验证（创建 → 归档 → 崩溃恢复）。
+
+1. **porcelain 行的裸字符串比较**（`lib/worktree.js` 六处：创建后的绑定证明、事务恢复的前置/后置、延迟删除、归档后置）。Windows 上 `git worktree list --porcelain` 打印 `worktree C:/Users/…`，而记录路径是 `join()` 生成的 `C:\Users\…`，`` `worktree ${path}` `` 恒不相等：每次创建都在 post-add 证明处失败（`cannot prove post-add worktree/branch ownership`），并因「无法证明未混入新增数据」保留半成品 —— 创建整体不可用。修复：新增 `worktreeRowHasPath(row, path)`，统一经 `normalizeGitPath` + `samePath` 比较；POSIX 仍是字节比较，Linux 行为不变。
+2. **`git worktree remove .` 在 path 模式不可用**：Git 自己的 cwd 就是要删除的目录，而 Windows 拒绝删除活动进程的当前目录（`failed to delete …: Permission denied`）→ 归档恒失败、半成品清不掉。修复：dirfd 模式保持 `remove .` + 锚定 cwd；path 模式改传已验证的规范路径、cwd 取主仓库，锚点仍是前后的 dev/ino 证明与后置条件。
+3. **`mainRepoRootOf` 返回非规范路径**：它曾直接返回 `dirname(git-common-dir)`（Windows 上正斜杠），该值写入 worktree 元数据与创建事务日志，而所有读取方一律拿 realpath 规范路径比较 → 恢复恒判 `journal-invalid`，崩溃遗留的日志永不回收。修复：返回 `safeRealpath(dirname(…))`（POSIX 上等价）。
+
+新增覆盖：`worktreeRowHasPath` 的合成 Windows 行断言（在 POSIX CI 上以模拟 win32 运行），填补第 1 类的盲区；第 2、3 类由真机端到端验证确认。
