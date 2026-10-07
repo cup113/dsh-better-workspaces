@@ -30,7 +30,13 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
    `<source workspace> · <branch>` (renamed as the very next call after
    registration), creates the target session, migrates the
    typed draft through the official conversation-input API, opens it and
-   retires the blank launcher — with full rollback on any failure. The
+   retires the blank launcher. The migration is best-effort on top of a
+   durable creation: once the worktree, Workspace and target Session exist the
+   creation HAS succeeded, so a draft that cannot follow — a composer still
+   submitting a command, or a draft holding a reference chip the public API
+   cannot rebuild — leaves the source Session unarchived (its draft is never
+   hidden), keeps the transaction record so Create again replays the same txId
+   and retries only the handoff, and says which reason applied. The
    workspace title follows every session title
    as `<source> · <session title>` — only ever for the workspace owning the
    current session's cwd, since every git detection result is tagged with the

@@ -15,7 +15,7 @@ process.env.DSH_HOME = join(scratch, 'dshhome');
 mkdirSync(process.env.DSH_HOME, { recursive: true });
 
 const { detectRepo, resolveDefaultBranch, listBranches, diffStat, porcelainStatus, aheadBehind, runGit, withPinnedGitEnvironment, listCommits, unpushedShas } = await import('../lib/git.js');
-const { createWorktree, listManagedWorktrees, readMetadata, patchMetadata, archiveWorktree, prepareWorkspaceDeletion, pendingWorkspaceDeletions, completeWorkspaceDeletion, recoverPendingTransactions, repoWorktreesRoot, worktreesRoot, validateManagedWorktree, worktreeRowHasPath, deriveWorktreeLeaf } = await import('../lib/worktree.js');
+const { createWorktree, listManagedWorktrees, readMetadata, patchMetadata, archiveWorktree, prepareWorkspaceDeletion, pendingWorkspaceDeletions, completeWorkspaceDeletion, recoverPendingTransactions, repoWorktreesRoot, worktreesRoot, validateManagedWorktree, worktreeRowHasPath, deriveWorktreeLeaf, claimWorktreeCreationSource, releaseWorktreeCreationSource, commitWorktreeCreationReceipt } = await import('../lib/worktree.js');
 const { computeDiff, commitDiff } = await import('../lib/diff.js');
 const { commitAction, pullAction, pushAction, discardAction, updateFromBaseAction, createPrAction, buildActionLadder } = await import('../lib/actions.js');
 const { createGitStateHub } = await import('../lib/state.js');
@@ -1532,11 +1532,55 @@ await test('api creation tx replays one durable Workspace and defers destructive
     const conflict = await conflictResponse.json();
     assert.equal(conflictResponse.status, 409, JSON.stringify(conflict));
     assert.equal(conflict.error, 'transaction_conflict');
-    const duplicateTabResponse = await post('/worktrees', { ...request, txId: 'client-create-tx-0002' });
-    const duplicateTab = await duplicateTabResponse.json();
-    assert.equal(duplicateTabResponse.status, 409, JSON.stringify(duplicateTab));
-    assert.match(duplicateTab.message, /source session already owns another creation transaction/,
-      'two browser realms cannot mint two worktrees for one launcher');
+    /* A launcher that ALREADY created a worktree must not be locked out of that
+       repository. The old claim file from the committed transaction stayed
+       behind, the client clears its txId on success, and the next attempt's
+       fresh txId hit a raw 409 that no retry could ever clear. The claim is a
+       lease — a committed receipt settles it — so the same source Session can
+       create again. */
+    const settledReuseResponse = await post('/worktrees', { ...request, txId: 'client-create-tx-0002' });
+    const settledReuse = await settledReuseResponse.json();
+    assert.equal(settledReuseResponse.status, 201, JSON.stringify(settledReuse));
+    assert.notEqual(settledReuse.path, first.path, 'a settled launcher is not a permanent lock');
+    assert.equal(rows.filter((row) => row.path === settledReuse.path).length, 1);
+    const claimFile = join(await repoWorktreesRoot(realpathSync(txRepo)),
+      `.creation-source-${createHash('sha256').update('session-create-tx-source').digest('hex')}.json`);
+    const supersededClaim = JSON.parse(readFileSync(claimFile, 'utf8'));
+    assert.equal(supersededClaim.version, 2, 'the superseding claim records its provenance');
+    assert.equal(supersededClaim.supersededTxId, 'client-create-tx-0001');
+    assert.equal(supersededClaim.txId, 'client-create-tx-0002');
+
+    /* The invariant that remains: two realms cannot mint two worktrees for one
+       launcher WHILE its previous transaction can still be in flight. A live
+       create journal is that proof. */
+    const inFlightSource = 'session-create-tx-inflight';
+    const inFlightTx = 'client-create-tx-inflight';
+    await claimWorktreeCreationSource(txRepo, inFlightSource, inFlightTx, 'a'.repeat(64));
+    await writeFileSync(join(await repoWorktreesRoot(realpathSync(txRepo)), `.pending-${inFlightTx}.json`), JSON.stringify({
+      version: 1,
+      txId: inFlightTx,
+      mainRepoRoot: realpathSync(txRepo),
+      ownerPid: process.pid,
+      phase: 'prepared',
+      path: join(await repoWorktreesRoot(realpathSync(txRepo)), 'never-created'),
+      branch: 'never-created',
+      expectedOid: 'b'.repeat(40),
+      ownsBranch: false,
+    }));
+    const inFlightResponse = await post('/worktrees', {
+      ...request,
+      sourceSessionId: inFlightSource,
+      txId: 'client-create-tx-0004',
+      branchName: 'tx-inflight-refused',
+      slug: 'tx-inflight-refused',
+    });
+    const inFlight = await inFlightResponse.json();
+    assert.equal(inFlightResponse.status, 409, JSON.stringify(inFlight));
+    assert.equal(inFlight.error, 'transaction_pending', 'an unsettled previous transaction still refuses');
+    assert.equal(inFlight.previous.status, 'pending');
+    const refusedClaim = JSON.parse(readFileSync(join(await repoWorktreesRoot(realpathSync(txRepo)),
+      `.creation-source-${createHash('sha256').update(inFlightSource).digest('hex')}.json`), 'utf8'));
+    assert.equal(refusedClaim.txId, inFlightTx, 'a refusal never rewrites the lease it refused');
 
     const archiveResponse = await post('/action', {
       cwd: first.path,
@@ -1618,10 +1662,77 @@ await test('api creation tx replays one durable Workspace and defers destructive
     });
     assert.equal(rotatedArchive.status, 200, JSON.stringify(await rotatedArchive.json()));
   } finally {
+    // The hand-written in-flight journal is a fixture, not a transaction: the
+    // abandoned sweep walks every managed root and would report it forever.
+    rmSync(join(await repoWorktreesRoot(realpathSync(txRepo)), '.pending-client-create-tx-inflight.json'), { force: true });
+    await releaseWorktreeCreationSource(txRepo, 'session-create-tx-inflight', 'client-create-tx-inflight', 'a'.repeat(64));
     await api.dispose();
     await new Promise((resolveClose) => server.close(resolveClose));
     await hub.dispose();
   }
+});
+
+await test('creation source claim is a per-launcher lease, not a permanent lock', async () => {
+  const leaseRepo = join(scratch, 'claim-lease-repo');
+  mkdirSync(leaseRepo);
+  git(leaseRepo, 'init', '-b', 'main');
+  git(leaseRepo, 'config', 'user.email', 'test@dsh.local');
+  git(leaseRepo, 'config', 'user.name', 'DSH Test');
+  writeFileSync(join(leaseRepo, 'base.txt'), 'base\n');
+  git(leaseRepo, 'add', '-A');
+  git(leaseRepo, 'commit', '-m', 'base');
+  const leaseRoot = await repoWorktreesRoot(leaseRepo);
+  const source = 'session-lease-source-0001';
+  const claimFile = join(leaseRoot, `.creation-source-${createHash('sha256').update(source).digest('hex')}.json`);
+  const fingerprint = 'c'.repeat(64);
+
+  const first = await claimWorktreeCreationSource(leaseRepo, source, 'lease-tx-000000000001', fingerprint);
+  assert.equal(first.version, 1);
+  const idempotent = await claimWorktreeCreationSource(leaseRepo, source, 'lease-tx-000000000001', fingerprint);
+  assert.equal(idempotent.txId, 'lease-tx-000000000001', 'the same transaction stays idempotent');
+  await assert.rejects(
+    claimWorktreeCreationSource(leaseRepo, source, 'lease-tx-000000000001', 'd'.repeat(64)),
+    (error) => error.code === 'WORKTREE_SOURCE_CONFLICT',
+    'one transaction id may never describe two different requests');
+
+  // An attempt that left neither receipt nor create journal behind proved it
+  // never committed: it must not fence its launcher forever.
+  const stale = await claimWorktreeCreationSource(leaseRepo, source, 'lease-tx-000000000002', fingerprint);
+  assert.equal(stale.version, 2);
+  assert.equal(stale.supersededTxId, 'lease-tx-000000000001');
+  assert.equal(JSON.parse(readFileSync(claimFile, 'utf8')).txId, 'lease-tx-000000000002');
+
+  // A live create journal IS the proof that the previous transaction can still
+  // be in flight — the one refusal that survives.
+  const pendingFile = join(leaseRoot, '.pending-lease-tx-000000000002.json');
+  writeFileSync(pendingFile, JSON.stringify({ version: 1, txId: 'lease-tx-000000000002', ownerPid: process.pid }));
+  await assert.rejects(
+    claimWorktreeCreationSource(leaseRepo, source, 'lease-tx-000000000003', fingerprint),
+    (error) => error.code === 'WORKTREE_TX_PENDING' && error.previous?.status === 'pending');
+  writeFileSync(pendingFile, JSON.stringify({ version: 1, txId: 'lease-tx-000000000002', ownerPid: 0 }));
+  await assert.rejects(
+    claimWorktreeCreationSource(leaseRepo, source, 'lease-tx-000000000003', fingerprint),
+    (error) => error.code === 'WORKTREE_SOURCE_CONFLICT' && error.previous?.status === 'stale');
+  assert.equal(JSON.parse(readFileSync(claimFile, 'utf8')).txId, 'lease-tx-000000000002',
+    'a refusal never rewrites the lease it refused');
+
+  // A committed receipt settles the lease: the 409 that used to outlive every
+  // retry because nothing ever released that claim.
+  rmSync(pendingFile, { force: true });
+  await commitWorktreeCreationReceipt(leaseRepo, 'lease-tx-000000000002', fingerprint, {
+    path: join(leaseRoot, 'lease-worktree'), branch: 'lease-branch', workspaceId: 'ws-lease',
+  });
+  const afterCommit = await claimWorktreeCreationSource(leaseRepo, source, 'lease-tx-000000000004', fingerprint);
+  assert.equal(afterCommit.txId, 'lease-tx-000000000004');
+  assert.equal(afterCommit.supersededTxId, 'lease-tx-000000000002');
+
+  // An unreadable claim cannot be proven settled; refusing is the only exit
+  // that cannot mint a second worktree for one launcher.
+  writeFileSync(claimFile, '{not json');
+  await assert.rejects(
+    claimWorktreeCreationSource(leaseRepo, source, 'lease-tx-000000000005', fingerprint),
+    (error) => error.code === 'WORKTREE_SOURCE_CONFLICT');
+  rmSync(claimFile, { force: true });
 });
 
 await test('api creation adopts a managed root that predates the owner record', async () => {

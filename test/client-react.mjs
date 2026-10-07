@@ -323,6 +323,245 @@ const { heroCwdFor, heroControlKey } = mod.__bwTest;
   restoreCreate();
 }
 
+/* ------------------------------------------------------------------ *
+ * the two staged-create failures ADR 0016 fixes:
+ *   1. a composer in a command state refused the draft handoff forever —
+ *      the phase was read from the click-time snapshot, so the retry loop
+ *      kept re-reading a frozen value while the worktree was already made;
+ *   2. a handoff that failed AFTER the worktree, Workspace and Session
+ *      existed was reported as a failed creation, in the Host's English.
+ * ------------------------------------------------------------------ */
+{
+  // Interpolation-aware like the real dictionaries would be: a bare key hides
+  // exactly the cause the copy exists to name.
+  const translateKey = (key, params) => (params && params.reason ? key + ':' + params.reason
+    : params && params.message ? key + ':' + params.message : key);
+
+  async function heroCreateScenario({ draft = 'carry me', phase = 'plain', occurrences = [],
+    targetReadable = true, postResponse } = {}) {
+    const sessionId = 'hero-' + Math.random().toString(36).slice(2, 10);
+    let sessionSnapshot = { byId: { [sessionId]: { cwd: '/repo-hero', title: 'Hero' } }, ids: [sessionId], phase: 'ready' };
+    let sourceState = { draft, draftRev: 1, phase, attachmentIds: [], occurrences };
+    const sourceInput = {
+      state: { getSnapshot: () => sourceState },
+      setDraft(text) { sourceState = { ...sourceState, draft: text, draftRev: sourceState.draftRev + 1 }; },
+      addAttachments() { return false; },
+      removeAttachment() { return false; },
+    };
+    let targetState = { draft: '', draftRev: 1, phase: 'plain', attachmentIds: [], occurrences: [] };
+    const targetInput = {
+      state: { getSnapshot: () => targetState },
+      setDraft(text) { targetState = { ...targetState, draft: text, draftRev: targetState.draftRev + 1 }; },
+      addAttachments() { return false; },
+      removeAttachment() { return false; },
+    };
+    const calls = { posts: [], reveals: [], archived: [], retained: [], released: [], created: [], targetScopes: [] };
+    const conversation = {
+      input: {
+        for(scope) {
+          if (scope.id === sessionId) return sourceInput;
+          calls.targetScopes.push(scope.id);
+          return targetReadable ? targetInput : undefined;
+        },
+      },
+      blocks: { set() {} },
+    };
+    // One stable snapshot object: useSyncExternalStore re-renders forever on a
+    // fresh object per read.
+    const workspaceStore = {
+      snapshot: { items: [], archivedSessionIds: [], pinnedSessionIds: [], state: 'ready', phase: 'ready', error: null },
+      subscribe() { return () => {}; },
+      getSnapshot() { return this.snapshot; },
+    };
+    const uiSession = stubUiSession(sessionId);
+    const restore = mod.__bwTest.setTestRuntime({
+      get: (name) => {
+        if (name === 'uiSession') return uiSession;
+        if (name === 'uiWorkspace') return { openSession: (id) => calls.reveals.push(id) };
+        if (name === 'conversation') return conversation;
+        return undefined;
+      },
+      sessions: {
+        list: { getSnapshot: () => sessionSnapshot, subscribe: () => () => {} },
+        scope: (id) => ({ id, get: (name) => (name === 'conversation' ? conversation : undefined) }),
+        // The real controller publishes the new Session into its catalog before
+        // resolving, and refuses a second create of the same preallocated id —
+        // which is exactly what a replayed txId converges on.
+        create: async (opts) => {
+          if (sessionSnapshot.byId[opts.sessionId]) throw new Error('session already exists: ' + opts.sessionId);
+          sessionSnapshot = {
+            ...sessionSnapshot,
+            byId: { ...sessionSnapshot.byId, [opts.sessionId]: { cwd: '/wt/hero-branch', title: 'target' } },
+            ids: [...sessionSnapshot.ids, opts.sessionId],
+          };
+          calls.created.push(opts.sessionId);
+          return opts.sessionId;
+        },
+        retain: (id) => {
+          calls.retained.push(id);
+          return { ready: Promise.resolve(), release() { calls.released.push(id); } };
+        },
+      },
+      workspaces: {
+        list: workspaceStore,
+        // The receipt's Workspace is looked up by path+id after the create.
+        create: async (opts) => ({ workspaceId: 'ws-hero', path: opts.path }),
+        rename: async () => {},
+        archiveSession: async (id) => { calls.archived.push(id); },
+      },
+    }, null, translateKey);
+    const previousFetch = window.fetch;
+    window.fetch = async (url, options = {}) => {
+      const parsed = new URL(String(url), window.location.href);
+      if (parsed.pathname.endsWith('/detect')) {
+        return { json: async () => ({ ok: true, isGit: true, isLinkedWorktree: false, managed: false }) };
+      }
+      if (parsed.pathname.endsWith('/branches')) {
+        return { json: async () => ({ ok: true, current: 'main', branches: [{ name: 'main', hasLocal: true, hasRemote: false, current: true }] }) };
+      }
+      if (parsed.pathname.endsWith('/pulls')) return { json: async () => ({ ok: true, items: [] }) };
+      if (parsed.pathname.endsWith('/worktrees') && options.method === 'POST') {
+        calls.posts.push(JSON.parse(String(options.body || '{}')));
+        return { json: async () => postResponse };
+      }
+      throw new Error(`unexpected hero create request: ${parsed.pathname}${parsed.search}`);
+    };
+    globalThis.fetch = window.fetch;
+    const settle = async (ms = 0) => {
+      await act(async () => {
+        await new Promise((resolve) => { setTimeout(resolve, ms); });
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+    };
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => { root.render(React.createElement(mod.__bwTest.HeroControl)); });
+    await settle();
+    await act(async () => { container.querySelector('.dsh-bw-hero-btn').click(); });
+    await settle();
+    const newItem = [...container.querySelectorAll('.dsh-bw-menu-item')]
+      .find((i) => i.textContent.includes('hero.modeWorktree'));
+    await act(async () => { newItem.click(); });
+    await settle();
+    const clickCreate = async () => {
+      await act(async () => { container.querySelector('button.dsh-bw-btn-primary').click(); });
+    };
+    await clickCreate();
+    return {
+      calls,
+      container,
+      sessionId,
+      settle,
+      clickCreate,
+      setSourcePhase(next) { sourceState = { ...sourceState, phase: next }; },
+      sourceDraft: () => sourceState.draft,
+      targetDraft: () => targetState.draft,
+      errorText: () => container.querySelector('.dsh-bw-hero-error[role="alert"]')?.textContent || '',
+      record() {
+        try { return JSON.parse(window.localStorage.getItem('dsh.better-workspaces.create.' + sessionId) || 'null'); } catch { return null; }
+      },
+      async cleanup() {
+        await act(async () => { root.unmount(); });
+        container.remove();
+        window.fetch = previousFetch;
+        globalThis.fetch = window.fetch;
+        window.localStorage.removeItem('dsh.better-workspaces.create.' + sessionId);
+        restore();
+      },
+    };
+  }
+
+  const receipt = { ok: true, path: '/wt/hero-branch', branch: 'hero-branch', workspaceId: 'ws-hero' };
+
+  // A `claimed` composer is writable, so the draft follows the new Session —
+  // the state that used to answer `source-not-plain` forever.
+  {
+    const scenario = await heroCreateScenario({ draft: '/plan carry me', phase: 'claimed', postResponse: receipt });
+    await scenario.settle(80);
+    assert.equal(scenario.calls.posts.length, 1, 'a claimed composer still creates');
+    assert.equal(scenario.targetDraft(), '/plan carry me', 'and its draft is handed off');
+    assert.equal(scenario.sourceDraft(), '', 'the source is cleared only after the target write');
+    assert.deepEqual(scenario.calls.archived, [scenario.sessionId], 'a completed handoff retires the launcher');
+    assert.deepEqual(scenario.calls.reveals, ['session-' + scenario.calls.posts[0].txId], 'and reveals the target');
+    assert.equal(scenario.record(), null, 'a completed handoff drops the tx record');
+    await scenario.cleanup();
+  }
+
+  // A submission still in flight is waited out BEFORE the request: the create
+  // arrives once the composer settles instead of arriving with a draft that can
+  // never follow it.
+  {
+    const scenario = await heroCreateScenario({ draft: 'mid submit', phase: 'submitting', postResponse: receipt });
+    await scenario.settle(120);
+    assert.equal(scenario.calls.posts.length, 0, 'the create waits for the composer instead of racing it');
+    scenario.setSourcePhase('plain');
+    await scenario.settle(400);
+    assert.equal(scenario.calls.posts.length, 1, 'a settled composer lets the create proceed');
+    assert.equal(scenario.targetDraft(), 'mid submit', 'and the draft still moves');
+    await scenario.cleanup();
+  }
+
+  // A composer that never settles creates NOTHING: the refusal is before the
+  // request, so there is no half-created worktree to explain afterwards.
+  {
+    const scenario = await heroCreateScenario({ draft: 'stuck', phase: 'submitting', postResponse: receipt });
+    await scenario.settle(1800);
+    assert.equal(scenario.calls.posts.length, 0, 'a composer that never settles never reaches the Host');
+    assert.equal(scenario.errorText(), 'hero.sourceBusy', 'and the reason is the translated key, not a code');
+    assert.equal(scenario.record(), null, 'nothing was minted for a request that was never sent');
+    assert.equal(scenario.sourceDraft(), 'stuck', 'the draft stays exactly where the user left it');
+    await scenario.cleanup();
+  }
+
+  // Committed creation, stranded draft: the worktree/Workspace/Session are real,
+  // so this is NOT a failed creation. The source keeps the draft (and is not
+  // archived), the notice names the reason, and Create again replays the SAME
+  // txId to retry only the handoff.
+  {
+    const scenario = await heroCreateScenario({
+      draft: 'see @issue',
+      occurrences: [{ source: 'forge', ref: 'issue:1' }],
+      postResponse: receipt,
+    });
+    await scenario.settle(120);
+    assert.equal(scenario.calls.posts.length, 1, 'the creation itself is sent');
+    assert.deepEqual(scenario.calls.archived, [], 'a stranded draft is never archived away');
+    assert.deepEqual(scenario.calls.reveals, [], 'and the user stays where their draft is');
+    assert.equal(scenario.errorText(), 'hero.draftStranded:hero.reasonSourceChips', 'the reason is named in the copy');
+    assert.equal(scenario.record()?.txId, scenario.calls.posts[0].txId, 'the settled record is kept for the retry');
+    await scenario.clickCreate();
+    await scenario.settle(150);
+    assert.equal(scenario.calls.posts.length, 2, 'the retry is a real request');
+    assert.equal(scenario.calls.posts[1].txId, scenario.calls.posts[0].txId, 'and it replays the same transaction');
+    assert.equal(scenario.calls.posts[1].branchName, scenario.calls.posts[0].branchName);
+    assert.equal(scenario.calls.created.length, 1,
+      'the target Session of the replayed txId converges instead of failing on "already exists"');
+    assert.equal(scenario.errorText(), 'hero.draftStranded:hero.reasonSourceChips',
+      'and the retry reports the same, still-true reason');
+    await scenario.cleanup();
+  }
+
+  // The Host's admission refusal has a typed code: the English internal string
+  // must never be what a user reads.
+  {
+    const scenario = await heroCreateScenario({
+      postResponse: {
+        ok: false,
+        error: 'source_conflict',
+        message: 'worktree: source session already owns another creation transaction',
+      },
+    });
+    await scenario.settle(60);
+    assert.equal(scenario.errorText(), 'hero.sourceConflict', 'a typed refusal renders its own copy');
+    assert.ok(!scenario.errorText().includes('worktree:'), 'and never the Host sentence');
+    assert.equal(scenario.calls.posts.length, 1, 'the record survives an unidentified outcome for the next retry');
+    assert.ok(scenario.record(), 'so the same txId can be replayed');
+    await scenario.cleanup();
+  }
+}
+
 /* The real component, in the state that matters: a blank Session whose cwd
    comes only from its Workspace membership. */
 {

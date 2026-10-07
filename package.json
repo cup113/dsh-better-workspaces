@@ -1,7 +1,7 @@
 {
   "name": "dsh-better-workspaces",
   "description": "Git workspace enhancements for the DeepSeek Harness Web GUI: worktree staging in the hero row, per-session git badges in the sidebar, a diff page in the official right sidebar, paseo-style pull/push/PR actions",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "type": "module",
   "main": "lib/index.js",
   "exports": {

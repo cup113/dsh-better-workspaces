@@ -964,13 +964,58 @@ changedSource.setDraft('new');
 assert.equal(T.transferSessionDraft(changedSessions, 'source', 'target', staleDraft), false);
 assert.equal(changedSource.state.getSnapshot().draft, 'new', 'draftRev CAS preserves a newer source draft');
 assert.equal(changedTarget.state.getSnapshot().draft, '');
-const claimedSource = draftInput('claim');
+/* `claimed` is a WRITABLE tier: the contract refuses draft writes only in the
+   two busy phases (adjudicating/submitting), `setDraft` is unguarded, and the
+   forge attach path already treats plain||claimed as writable. A composer
+   holding a command claim used to be a permanent "source-not-plain" dead end. */
+const claimedSource = draftInput('/plan carry on');
 const claimedTarget = draftInput('');
-const claimedSessions = draftSessions(claimedSource, claimedTarget, () => { throw new Error('must not reveal'); });
+const claimedSessions = draftSessions(claimedSource, claimedTarget, () => {});
 const claimedCapture = T.readSessionDraft(claimedSessions, 'source');
 claimedSource.setPhase('claimed');
-assert.equal(T.transferSessionDraft(claimedSessions, 'source', 'target', claimedCapture), false,
-  'a phase transition fences draft transfer even when text/revision are unchanged');
+assert.equal(T.transferSessionDraft(claimedSessions, 'source', 'target', claimedCapture), true,
+  'a claimed composer is still writable, so the draft moves');
+assert.equal(claimedSource.state.getSnapshot().draft, '');
+assert.equal(claimedTarget.state.getSnapshot().draft, '/plan carry on');
+
+/* The frozen-capture regression: the snapshot captured at the click had a FROZEN
+   phase (the user had just pressed Enter on a command) while the live composer
+   had already settled. Judging the captured phase made the caller's 50 ms retry
+   loop meaningless — the frozen value can never change. The gate reads the live
+   tier now, so the same unchanged draft goes through. */
+const fencedSource = draftInput('late draft');
+const fencedTarget = draftInput('');
+const fencedSessions = draftSessions(fencedSource, fencedTarget, () => {});
+fencedSource.setPhase('submitting');
+const fencedCapture = T.readSessionDraft(fencedSessions, 'source');
+assert.equal(fencedCapture.phase, 'submitting', 'the capture really is frozen');
+fencedSource.setPhase('plain');
+assert.equal(T.transferSessionDraft(fencedSessions, 'source', 'target', fencedCapture), true,
+  'a settled submission does not fence an otherwise unchanged draft');
+assert.equal(fencedTarget.state.getSnapshot().draft, 'late draft');
+
+/* A submission still in flight is never written into, and never cleared. */
+const busySource = draftInput('mid submit');
+const busyTarget = draftInput('');
+const busySessions = draftSessions(busySource, busyTarget, () => { throw new Error('must not reveal'); });
+busySource.setPhase('submitting');
+assert.equal(T.transferSessionDraft(busySessions, 'source', 'target', T.readSessionDraft(busySessions, 'source')), false,
+  'the busy tier refuses even when the text and revision match');
+assert.equal(T.lastDraftTransferReason(), 'source-not-plain');
+assert.equal(busySource.state.getSnapshot().draft, 'mid submit');
+assert.equal(busyTarget.state.getSnapshot().draft, '');
+
+/* Nothing to move: the target's scope cannot fail a transfer that has no
+   payload, which is the common blank-launcher create. */
+const blankSource = draftInput('');
+const blankConversation = { input: { for: (scope) => scope.id === 'source' ? blankSource : undefined } };
+const blankSessions = {
+  scope: (id) => ({ id, get: (name) => name === 'conversation' ? blankConversation : undefined }),
+};
+const revealedBeforeBlank = revealedSessions.length;
+assert.equal(T.transferSessionDraft(blankSessions, 'source', 'target', T.readSessionDraft(blankSessions, 'source')), true,
+  'an empty source is a successful no-op, whatever the target looks like');
+assert.deepEqual(revealedSessions.slice(revealedBeforeBlank), ['target'], 'and the target is still revealed');
 
 const detachedSource = draftInput('detached');
 const replacementSource = draftInput('live replacement');
@@ -1073,6 +1118,28 @@ assert.equal(T.transferSessionDraft(
   { rebindDraftFiles() {} },
 ), false, 'structured references fail closed because setDraft cannot preserve chips');
 assert.equal(referenceSource.state.getSnapshot().draft, '@issue');
+
+/* Every code a transfer can record has a phrase of its own: rendering the raw
+   code (or the Host's English message) is the defect this table prevents. */
+for (const reason of [
+  'source-not-plain', 'source-changed-during-handoff', 'source-input-replaced', 'source-input-unavailable',
+  'source-draft-unavailable', 'source-composer-unavailable', 'target-input-unavailable', 'target-not-plain',
+  'target-draft-not-empty', 'target-has-attachments', 'source-has-occurrences', 'attachment-capability-missing',
+  'target-attach-failed', 'target-draft-write-failed', 'source-clear-failed', 'source-detach-failed',
+  'source-not-cleared', 'same-session', 'unknown',
+]) {
+  assert.match(T.draftReasonLabel(reason, (key) => key), /^hero\.reason[A-Z]/, reason + ' has its own phrase');
+}
+assert.equal(T.draftReasonLabel('a-code-from-the-future', (key) => key), 'hero.reasonUnknown');
+assert.equal(T.draftHandoffNoticeKey('source-not-plain'), 'hero.draftStayed', 'a retryable reason invites another click');
+assert.equal(T.draftHandoffNoticeKey('source-has-occurrences'), 'hero.draftStranded', 'chips are not retryable');
+assert.equal(
+  T.createFailureText({ error: 'source_conflict', message: 'worktree: source session already owns another creation transaction' }, (key) => key),
+  'hero.sourceConflict',
+  'a typed Host refusal never reaches the user as its English internal message',
+);
+assert.equal(T.createFailureText({ error: 'boom', message: 'boom' }, (key, params) => key + (params ? ':' + params.message : '')),
+  'hero.failed:boom', 'an unknown code keeps the raw message as the fallback');
 
 const persistedA = T.heroCreationRequest('source-tx', { cwd: '/a', base: 'main', branchName: 'fix-login' }, () => ({ branchName: 'fix-login', base: 'main' }));
 const persistedB = T.heroCreationRequest('source-tx', { cwd: '/a', base: 'main', branchName: 'fix-login' }, () => ({ branchName: 'clobber', base: 'main' }));
